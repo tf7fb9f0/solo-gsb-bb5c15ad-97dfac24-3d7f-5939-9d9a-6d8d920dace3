@@ -15,8 +15,8 @@ docker compose up --build
 - 健康检查：`GET http://localhost:8000/health`
 
 依赖安装与建表均在启动时自动完成：Compose 启动 Postgres 16 与 API 两个容器，
-API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` /
-`reveals` / `deadline_extensions` / `settlements`）。
+API 等待数据库健康检查后启动，并在启动时初始化或核对数据表（`events` / `commitments` /
+`reveals` / `deadline_extensions` / `settlements`，详见下文「启动期持久库结构校验」）。
 两个容器均带 healthcheck，`docker compose ps` 中状态变为 `healthy` 即就绪。
 
 ## 承诺哈希方案
@@ -70,7 +70,26 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}/interval-report` | 已结算事件的数值区间预测报告（只读，十进制精确覆盖判定与排名） |
 | POST | `/events/probability-calibration-report` | 跨事件概率校准报告（只读，Decimal 精确 Brier 均分与十分箱校准汇总） |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 健康检查（启动期结构校验未通过时返回 503 `SCHEMA_NOT_READY`） |
+
+## 启动期持久库结构校验
+
+服务启动时区分三种持久库情形，**结构不完整的半旧库会阻止 API 就绪**，避免
+「`/health` 报 ok、事件接口随后 500」的假象：
+
+1. **空库**（不存在任何应用表）：按当前 SQLAlchemy 模型全量建表，正常启动；
+2. **完整旧库**（全部应用表及模型要求的列均已存在）：**保留既有数据**，
+   不重建、不补建，正常启动；
+3. **半旧库**（已有部分应用表，但缺表或缺必需列，例如旧版 `events` 表缺少
+   `reveal_deadline`）：`create_all` 只建缺失的表、**不会为已存在的表补列**，
+   继续启动会让依赖缺失列的接口在请求期才报错。因此启动时即按模型核对全部
+   应用表与必需列，发现缺项时**不在半旧库上补建其它表**，而是在日志中明确
+   列出缺失的表名与列名（如 `数据表 events 缺少必需列：reveal_deadline`），
+   随后启动失败、进程退出：Compose 中 `api` 容器不会进入 healthy，
+   `/health` 不可达（进程内校验未完成时返回 503 `SCHEMA_NOT_READY`）。
+
+此时请使用与当前版本匹配的数据库，或先备份数据后按新版本迁移/重建
+（彻底重置可用 `docker compose down -v` 删除数据卷后重新启动）。
 
 ## 完整使用示例
 
@@ -1020,7 +1039,7 @@ curl -s -X POST http://localhost:8000/events/probability-calibration-report \
 ```bash
 docker compose up --build       # 前台启动（加 -d 后台运行）
 docker compose ps               # 查看两个容器健康状态（db / api 均为 healthy 即就绪）
-docker compose logs -f api      # 跟踪 API 日志（含「database schema ready」建表日志）
+docker compose logs -f api      # 跟踪 API 日志（含结构初始化/核对日志；半旧库会列出缺失表与列）
 docker compose down             # 停止并删除容器（保留数据卷）
 docker compose down -v          # 停止并连同 Postgres 数据卷 pgdata 一起删除（彻底重置）
 ```
@@ -1033,8 +1052,10 @@ Compose 编排说明（见 `docker-compose.yml`）：
 - **api**：由仓库 `Dockerfile` 构建（`python:3.12-slim` + `requirements.txt`，
   启动命令为 `uvicorn app.main:app --host 0.0.0.0 --port 8000`），
   通过 `depends_on: condition: service_healthy` 等待数据库健康后再启动，
-  启动时自动建表（`events` / `commitments` / `reveals` /
-  `deadline_extensions` / `settlements`），宿主端口 `8000`；自带 `/health` healthcheck。
+  启动时自动初始化或核对数据表（`events` / `commitments` / `reveals` /
+  `deadline_extensions` / `settlements`；空库建表、完整旧库保留数据、
+  半旧库拒绝就绪，见「启动期持久库结构校验」），宿主端口 `8000`；
+  自带 `/health` healthcheck。
 - API 通过环境变量 `DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/predictions`
   连接数据库；如本机 5432 或 8000 端口被占用，可在 `docker-compose.yml`
   中修改 `ports` 映射（容器内端口不变）。
@@ -1071,8 +1092,9 @@ app/
   merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
   intervals.py  # 数值区间预测报告：有限十进制解析、精确覆盖判定与命中排名（纯函数）
   calibration.py # 跨事件概率校准报告：[0,1] 概率严格解析、Decimal Brier 均分与十分箱汇总（纯函数）
-  database.py   # 引擎与会话（DATABASE_URL 可配置）
+  database.py   # 引擎与会话（DATABASE_URL 可配置）及启动期结构初始化/核对（空库建表、完整旧库放行、半旧库拒绝）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
+tests/test_schema_startup.py  # 启动期结构校验：空库建表、完整旧库保留数据、半旧库缺表/缺列阻止就绪
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
 tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、冲突对与确定性

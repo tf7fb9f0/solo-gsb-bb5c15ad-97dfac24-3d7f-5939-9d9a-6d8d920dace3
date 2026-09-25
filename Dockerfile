@@ -12,5 +12,5 @@ COPY app ./app
 
 EXPOSE 8000
 
-# 启动时自动完成建表（见 app/main.py 的 lifespan）
+# 启动时初始化/核对持久库结构（见 app/database.py 的 initialize_schema 与 app/main.py 的 lifespan）
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from . import calibration, clock, intervals, merkle
-from .database import Base, engine, get_db
+from .database import SchemaIncompleteError, engine, get_db, initialize_schema
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
 from .scheduling import PHASES as SCHEDULE_PHASES, schedule
@@ -75,6 +75,10 @@ NO_MATCHING_COMMITMENT = "NO_MATCHING_COMMITMENT"
 DUPLICATE_REVEAL = "DUPLICATE_REVEAL"
 
 logger = logging.getLogger("sealed-predictions")
+
+# 启动期结构校验结果：仅在 lifespan 成功完成初始化/核对后置 True。
+# 结构不完整的半旧库上该标志保持 False，/health 返回 503，阻止 API 就绪。
+schema_ready = False
 
 
 def now_utc() -> datetime:
@@ -157,19 +161,33 @@ def api_error(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时建表；数据库尚未就绪时重试，等待 Compose 中的 Postgres 起来
+    # 启动时初始化或核对持久库结构；数据库尚未就绪时重试，等待 Compose 中的
+    # Postgres 起来。结构不完整的半旧库（缺表/缺列）不重试、直接启动失败，
+    # 阻止 API 就绪，避免依赖缺失列的接口在请求期才以 500 暴露。
+    global schema_ready
     attempts = 30
     for attempt in range(1, attempts + 1):
         try:
-            Base.metadata.create_all(bind=engine)
-            logger.info("database schema ready")
-            break
+            mode = initialize_schema(engine)
         except OperationalError:
             if attempt == attempts:
                 raise
             logger.warning("database not ready, retrying (%s/%s)", attempt, attempts)
             time.sleep(1)
-    yield
+            continue
+        except SchemaIncompleteError as exc:
+            logger.error("database schema incomplete: %s", exc)
+            raise
+        if mode == "initialized":
+            logger.info("empty database: schema initialized from models")
+        else:
+            logger.info("existing database verified against models, data preserved")
+        schema_ready = True
+        break
+    try:
+        yield
+    finally:
+        schema_ready = False
 
 
 app = FastAPI(
@@ -304,6 +322,17 @@ def root():
 
 @app.get("/health")
 def health():
+    """健康检查：仅在启动期结构初始化/核对成功后报告就绪。
+
+    持久库为半旧结构（缺表/缺列）时启动即失败，本接口不可达；若进程内
+    结构校验尚未完成（如 lifespan 未运行），返回 503 而非误报 ok。
+    """
+    if not schema_ready:
+        raise api_error(
+            503,
+            "SCHEMA_NOT_READY",
+            "持久库结构尚未通过启动校验（缺失表或必需列），API 不就绪",
+        )
     return {"status": "ok"}
 
 
