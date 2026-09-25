@@ -13,15 +13,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from . import calibration, clock, intervals, merkle
-from .database import Base, engine, get_db
+from .database import engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
+from .schema_bootstrap import SchemaState, ensure_schema
 from .scheduling import PHASES as SCHEDULE_PHASES, schedule
 from .schemas import (
     COMMITMENT_HASH_PATTERN,
@@ -75,6 +77,13 @@ NO_MATCHING_COMMITMENT = "NO_MATCHING_COMMITMENT"
 DUPLICATE_REVEAL = "DUPLICATE_REVEAL"
 
 logger = logging.getLogger("sealed-predictions")
+# uvicorn 默认只配置根 logger；为本服务 logger 补一个 INFO 级控制台输出，
+# 保证启动期结构核对结果（空库初始化 / 旧库通过 / 半旧库阻止）在容器日志可见
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
 
 
 def now_utc() -> datetime:
@@ -157,18 +166,32 @@ def api_error(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时建表；数据库尚未就绪时重试，等待 Compose 中的 Postgres 起来
+    # 启动时核对持久库结构；数据库尚未就绪时重试，等待 Compose 中的 Postgres 起来。
+    # 空库直接建表；已有应用表按模型核对全部表与必需列，缺项时不补建，
+    # 仅把状态置为未就绪（见 /health 与 readiness 中间件），避免在半旧库上
+    # 误报就绪、业务接口随后因缺列报 500。
+    global schema_state
     attempts = 30
     for attempt in range(1, attempts + 1):
         try:
-            Base.metadata.create_all(bind=engine)
-            logger.info("database schema ready")
+            schema_state = ensure_schema(engine)
             break
         except OperationalError:
             if attempt == attempts:
                 raise
             logger.warning("database not ready, retrying (%s/%s)", attempt, attempts)
             time.sleep(1)
+
+    if schema_state.empty_initialized:
+        logger.info("database was empty: schema initialized, ready")
+    elif schema_state.ready:
+        logger.info("existing database schema matches models, ready (data preserved)")
+    else:
+        logger.error(
+            "database schema is incomplete, API will not serve traffic: %s",
+            schema_state.describe(),
+        )
+    # 就绪状态为启动核对的闩锁结果：关闭阶段不再改变它（关闭后也不会再有请求）
     yield
 
 
@@ -178,6 +201,44 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# 启动核对完成前保持 None（视为未就绪），lifespan 中由 ensure_schema 更新
+schema_state: SchemaState | None = None
+
+
+def not_ready_response() -> JSONResponse:
+    """构造结构核对未就绪时的统一 503 响应（含缺失表/列清单）。"""
+    if schema_state is None:
+        body = {
+            "status": "not_ready",
+            "code": "SCHEMA_NOT_READY",
+            "message": "服务尚未完成启动期数据库结构核对",
+            "missing_tables": [],
+            "missing_columns": {},
+        }
+    else:
+        body = {
+            "status": "not_ready",
+            "code": "SCHEMA_NOT_READY",
+            "message": "持久库结构与当前模型不一致，API 拒绝在半旧库上就绪："
+            + schema_state.describe(),
+            "missing_tables": list(schema_state.missing_tables),
+            "missing_columns": {
+                table: list(columns)
+                for table, columns in schema_state.missing_columns.items()
+            },
+        }
+    return JSONResponse(status_code=503, content=body)
+
+
+@app.middleware("http")
+async def require_ready_schema(request: Request, call_next):
+    """结构未就绪时阻止除 /health 之外的一切请求，返回明确的 503 而非后续 500。"""
+    if schema_state is not None and schema_state.ready:
+        return await call_next(request)
+    if request.url.path == "/health":
+        return await call_next(request)
+    return not_ready_response()
 
 
 # --------------------------------------------------------------------------- #
@@ -304,7 +365,15 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """就绪探针：仅当启动期结构核对通过时返回 200。
+
+    半旧库（缺表/缺列）时返回 503，并在响应中明确列出缺失的数据表名与
+    每张表缺失的必需列名——Compose 的 healthcheck 据此把 API 标记为
+    unhealthy，不会再出现结构不完整却报告 ok、事件接口随后 500 的情况。
+    """
+    if schema_state is not None and schema_state.ready:
+        return {"status": "ok"}
+    return not_ready_response()
 
 
 @app.post("/utils/commitment", response_model=HashOut)
